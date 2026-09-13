@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% block title %}Chat with {{ other_name }}{% endblock %}
+
+{% block content %}
+<style>
+  .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #adb5bd; margin-right: 6px; vertical-align: middle; }
+  .status-dot.live { background: #307e4e; box-shadow: 0 0 6px #307e4e; }
+  .chat-log { height: 55vh; min-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; background: #f8f9fa; }
+  .msg { max-width: 78%; padding: 8px 12px; border-radius: 14px; line-height: 1.4; word-wrap: break-word; }
+  .msg.mine { align-self: flex-end; background: #307e4e; color: #fff; border-bottom-right-radius: 4px; }
+  .msg.theirs { align-self: flex-start; background: #fff; border: 1px solid #dee2e6; border-bottom-left-radius: 4px; }
+  .msg.system { align-self: center; color: #6c757d; font-size: .8rem; font-style: italic; padding: 0; }
+  .msg .who { display: block; font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; opacity: .75; margin-bottom: 2px; }
+</style>
+
+<div class="card my-4 shadow-sm">
+  <div class="card-header bg-white d-flex flex-wrap justify-content-between align-items-center">
+    <div class="mr-3">
+      <h1 class="h5 mb-0">
+        Chat with <a href="{{ url_for('views.profile', public_id=other_public_id) }}">{{ other_name }}</a>
+      </h1>
+      <small class="text-muted">
+        You're the {{ 'tutor' if call_role == 'tutor' else 'student' }}
+        &middot; <span id="statusDot" class="status-dot"></span><span id="statusText">Connecting...</span>
+      </small>
+    </div>
+    <a class="btn btn-success mt-2 mt-sm-0" href="{{ url_for('views.call', public_id=other_public_id) }}">Start video call</a>
+  </div>
+
+  <div id="messages" class="chat-log card-body"></div>
+
+  <div class="card-footer bg-white">
+    <div class="input-group">
+      <input id="input" type="text" class="form-control" placeholder="Type a message and press Enter..." autocomplete="off" maxlength="2000">
+      <div class="input-group-append">
+        <button class="btn btn-success" type="button" onclick="send()">Send</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Room and role come from the server: the room is worked out from the two
+// people's IDs, so both land in the same one.
+const myClientId = {{ call_role | tojson }};
+const matchId = {{ room | tojson }};
+const otherName = {{ other_name | tojson }};
+
+// The live chat runs on the video app. An empty URL means it's served from
+// this same address (a combined deployment).
+const VIDEO_APP = {{ video_app_url | tojson }} || window.location.origin;
+const VIDEO_WS = VIDEO_APP.replace(/^http/, 'ws');   // http->ws, https->wss
+
+let ws = null;
+
+function setStatus(live, text) {
+  document.getElementById('statusDot').className = 'status-dot' + (live ? ' live' : '');
+  document.getElementById('statusText').textContent = text;
+}
+
+function appendMessage(kind, text, who) {
+  const box = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + kind;
+  if (who) {
+    const whoEl = document.createElement('span');
+    whoEl.className = 'who';
+    whoEl.textContent = who;
+    div.appendChild(whoEl);
+  }
+  div.appendChild(document.createTextNode(text));
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    ws.close();
+  }
+  ws = new WebSocket(`${VIDEO_WS}/ws/precall/${matchId}/${myClientId}`);
+
+  ws.addEventListener('open', () => {
+    setStatus(true, 'Connected');
+    appendMessage('system', `You joined the chat with ${otherName}.`);
+  });
+
+  ws.addEventListener('close', () => setStatus(false, 'Disconnected'));
+  ws.addEventListener('error', () => setStatus(false, 'Could not reach the chat server'));
+
+  ws.addEventListener('message', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'chat') {
+      if (data.client_id !== myClientId) {
+        appendMessage('theirs', data.content, otherName);
+      }
+    } else if (data.type === 'user_joined') {
+      if (data.client_id !== myClientId)
+        appendMessage('system', `${otherName} joined the chat.`);
+    } else if (data.type === 'user_left') {
+      if (data.client_id !== myClientId)
+        appendMessage('system', `${otherName} left the chat.`);
+    }
+  });
+}
+
+function send() {
+  const input = document.getElementById('input');
+  const text = input.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  appendMessage('mine', text, 'You');
+  ws.send(JSON.stringify({ type: 'chat', content: text }));
+  input.value = '';
+  input.focus();
+}
+
+document.getElementById('input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); send(); }
+});
+
+connect();
+</script>
+{% endblock %}

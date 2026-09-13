@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} - Profile{% endblock %}
+
+{% block content %}
+<div class="card my-4 shadow-sm">
+  <div class="card-body">
+    <div class="d-flex flex-wrap align-items-center">
+      {% if person.avatar_url %}
+        <img src="{{ person.avatar_url }}" alt="" width="96" height="96" class="rounded-circle mr-3 mb-2 flex-shrink-0">
+      {% endif %}
+      <div class="flex-grow-1 mb-2" style="min-width: 0;">
+        <h1 class="h3 mb-1">{{ name }}</h1>
+        <span class="badge {{ 'badge-success' if is_tutor else 'badge-info' }}">{{ 'Tutor' if is_tutor else 'Student' }}</span>
+        {% if is_tutor %}
+          <span class="text-muted small ml-2">
+            &#9733; {{ "%.1f" | format(details.rating or 0) }}
+            &middot; {{ "%.2f" | format(details.hourly_rate_sol or 0) }} SOL / hour
+          </span>
+        {% endif %}
+      </div>
+      <div class="mb-2">
+        {% if is_me %}
+          <a class="btn btn-outline-secondary" href="{{ url_for('views.onboarding') }}">Edit profile</a>
+        {% elif can_chat %}
+          <a class="btn btn-success" href="{{ url_for('views.chat', public_id=person.public_id) }}">Chat</a>
+          <a class="btn btn-outline-success" href="{{ url_for('views.call', public_id=person.public_id) }}">Video call</a>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if is_tutor and details.bio %}
+      <h2 class="h6 text-uppercase text-muted mt-4">About</h2>
+      <p class="mb-0">{{ details.bio }}</p>
+    {% elif not is_tutor and details.goals %}
+      <h2 class="h6 text-uppercase text-muted mt-4">Working toward</h2>
+      <p class="mb-0">{{ details.goals }}</p>
+    {% endif %}
+
+    <div class="row mt-4">
+      <div class="col-md-6 mb-3">
+        <h2 class="h6 text-uppercase text-muted">Subjects</h2>
+        {% for s in subjects %}<span class="badge badge-light border mr-1 mb-1 p-2">{{ s }}</span>{% endfor %}
+      </div>
+      <div class="col-md-6 mb-3">
+        <h2 class="h6 text-uppercase text-muted">{{ 'Teaches' if is_tutor else 'Grade level' }}</h2>
+        {% for l in levels %}<span class="badge badge-light border mr-1 mb-1 p-2">{{ l }}</span>{% endfor %}
+      </div>
+    </div>
+
+    {% if traits %}
+      <h2 class="h6 text-uppercase text-muted mt-2">{{ 'Teaching style' if is_tutor else 'Learning style' }}</h2>
+      <ul class="mb-0">
+        {% for t in traits %}<li>{{ t | capitalize }}</li>{% endfor %}
+      </ul>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

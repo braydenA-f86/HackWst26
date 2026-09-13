@@ -1,18 +1,26 @@
 import json
 import os
+import re
+import traceback
+from datetime import datetime, timezone
 from typing import Dict, List
 from urllib.parse import quote, urlparse
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi import Request, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pathlib import Path
 from fastapi import UploadFile, File, Form
 from Transcriber.Transcribe import run_pipeline
+from Transcriber.notes_file import build_notes, write_notes_files
 from tutormatch import (
     save_pipeline_result,
+    set_session_status,
+    get_session,
+    get_user,
+    public_name,
     get_transcript,
     get_session_notes,
-    attach_participant,
     get_session_participants,
 )
 from ice_servers import get_ice_servers
@@ -50,6 +58,19 @@ def _login_redirect(request: Request, route: str = "login", back: str | None = N
     return RedirectResponse(f"{_site_url()}/{route}?next={quote(back or str(request.url), safe='')}")
 
 
+# The call page is served by the website but uploads its recording here. Browsers
+# block that cross-address upload unless this app allows the website's origin,
+# and credentials lets the login cookie come along so the upload can be checked.
+# Websockets aren't subject to this, so the live chat and call need no entry.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_site_url()],
+    allow_credentials=True,
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
+
+
 # ============================================================
 # CONNECTION MANAGER
 # ============================================================
@@ -76,28 +97,82 @@ VIDEO_FOLDER = Path(__file__).parent / "Video_Folder"
 VIDEO_FOLDER.mkdir(exist_ok=True)
 
 
+def _participant(request: Request, session_id: str) -> tuple[dict, dict]:
+    """The logged-in user and their session, or an HTTP error if they weren't in it."""
+    user = get_current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    session = get_session(session_id)
+    if not session or user["sub"] not in (session.get("student_id"), session.get("tutor_id")):
+        raise HTTPException(status_code=403, detail="You weren't a participant in this session")
+    return user, session
+
+
+def _session_folder(session: dict) -> Path:
+    """Video_Folder/<room>/ - one folder per pair, holding one folder per call."""
+    name = re.sub(r"[^A-Za-z0-9_-]", "_", session.get("room_key") or str(session["id"]))
+    return VIDEO_FOLDER / name
+
+
+def _display_name(auth_sub: str | None) -> str:
+    user = get_user(auth_sub) if auth_sub else None
+    return public_name(user) if user else "Unknown"
+
+
+def process_recording(session_id: str, recording: Path) -> None:
+    """Transcribe a call, write notes.json + notes.md beside the recording, then
+    store the same notes in TigerData. Runs after the upload response is sent,
+    so the server keeps serving chats and calls while Gemini works."""
+    (recording.parent / "error.txt").unlink(missing_ok=True)   # clear a failure from an earlier try
+    try:
+        result = run_pipeline(str(recording), output_path=None)
+        session = get_session(session_id) or {}
+        notes = build_notes(
+            result,
+            session_id=session_id,
+            tutor=_display_name(session.get("tutor_id")),
+            student=_display_name(session.get("student_id")),
+        )
+        paths = write_notes_files(notes, recording.parent)
+        print(f"Notes written: {paths['md']}")
+        save_pipeline_result(session_id, result, recording_url=str(recording))
+    except Exception as err:
+        traceback.print_exc()
+        (recording.parent / "error.txt").write_text(f"{type(err).__name__}: {err}\n", encoding="utf-8")
+        try:
+            set_session_status(session_id, "failed")
+        except Exception:
+            traceback.print_exc()
+
+
 @app.post("/upload_recording")
 async def upload_recording(
+    request: Request,
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     session_id: str = Form(...),
     role: str = Form(...),
 ):
-    filename = f"{session_id}_{role}.webm"
-    save_path = VIDEO_FOLDER / filename
+    user, session = _participant(request, session_id)
+    if role not in ("tutor", "tutee"):
+        raise HTTPException(status_code=400, detail="role must be tutor or tutee")
+    if user["sub"] != session.get("tutor_id" if role == "tutor" else "student_id"):
+        raise HTTPException(status_code=403, detail="That isn't your role in this session")
+
+    # A new folder for every call, so a pair's earlier notes are never overwritten.
+    call_folder = _session_folder(session) / datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    call_folder.mkdir(parents=True, exist_ok=True)
+    save_path = call_folder / f"{role}.webm"
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
-    transcription = None
-    if role == "tutor":
-      output_json_path = VIDEO_FOLDER / f"{session_id}_{role}_output.json"
-      transcription = run_pipeline(str(save_path), output_path=str(output_json_path))
-      if transcription:
-        try:
-          save_pipeline_result(session_id, transcription, recording_url=str(save_path))
-        except Exception as db_err:
-          print(f"Warning: could not save transcript to database: {db_err}")
+    # Only the tutor's recording is transcribed - it carries both voices.
+    processing = role == "tutor"
+    if processing:
+        set_session_status(session_id, "processing", recording_url=str(save_path))
+        background.add_task(process_recording, session_id, save_path)
 
-    return {"status": "ok", "saved_to": str(save_path), "transcription": transcription}
+    return {"status": "ok", "processing": processing}
 
 manager = ConnectionManager()
 
@@ -348,29 +423,13 @@ async def logout():
     """Log out of Auth0 through the main site."""
     return RedirectResponse(f"{_site_url()}/logout")
 
+# The home, chat and call pages now live on the website, which links two real
+# people into a shared room. Anyone arriving at the old addresses goes there.
 @app.get("/")
-async def root():
-    return HTMLResponse(INDEX_HTML)
-
-
 @app.get("/precall")
-async def precall_page():
-    return HTMLResponse(PRECALL_HTML)
-
-
 @app.get("/call")
-async def call_page(request: Request, session: str = "", role: str = ""):
-    if (bounce := _wrong_host(request)) is not None:
-        return bounce
-    user = get_current_user(request)
-    if not user:
-        return _login_redirect(request)
-    if session and role:
-        try:
-            attach_participant(session, role, user["sub"])
-        except Exception as db_err:
-            print(f"Warning: could not attach participant to session: {db_err}")
-    return HTMLResponse(CALL_HTML)
+async def moved_to_site():
+    return RedirectResponse(_site_url())
 
 
 @app.get("/ice-servers")
@@ -392,751 +451,45 @@ async def transcript_page(session_id: str, request: Request):
     return HTMLResponse(TRANSCRIPT_HTML)
 
 
+def _latest_notes_folder(session: dict) -> Path | None:
+    """The most recent call folder that has finished notes. Folder names are
+    UTC timestamps, so sorting them by name sorts them by time."""
+    folder = _session_folder(session)
+    calls = sorted((p for p in folder.glob("*/notes.json")), key=lambda p: p.parent.name) if folder.is_dir() else []
+    return calls[-1].parent if calls else None
+
+
 @app.get("/api/transcript/{session_id}")
 async def api_transcript(session_id: str, request: Request):
-    user = get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not logged in")
-    participants = get_session_participants(session_id) or {}
-    if user["sub"] not in (participants.get("student_id"), participants.get("tutor_id")):
-        raise HTTPException(status_code=403, detail="You weren't a participant in this session")
+    _, session = _participant(request, session_id)
+    status = session.get("status")
     segments = get_transcript(session_id)
     notes = get_session_notes(session_id)
     return {
         "session_id": session_id,
-        "ready": bool(segments),
+        "status": status,
+        # While a newer call is being transcribed, don't show the previous one as if it were done.
+        "ready": bool(segments) and status not in ("processing", "failed"),
         "segments": segments,
         "notes": notes,
+        "has_notes_file": _latest_notes_folder(session) is not None,
     }
 
-# ============================================================
-# HOME PAGE
-# ============================================================
-INDEX_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>TutorMatch</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-""" + SHARED_CSS + """
-.hero {
-  text-align: center;
-  margin-bottom: 28px;
-}
-.hero h1 {
-  font-size: 34px;
-  background: linear-gradient(90deg, var(--green), var(--teal));
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-.grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-top: 8px;
-}
-@media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
-.launch-card {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 18px;
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  text-decoration: none;
-  color: var(--text);
-  transition: transform 0.12s ease, background 0.15s ease, border-color 0.15s ease;
-}
-.launch-card:hover {
-  transform: translateY(-3px);
-  background: rgba(255, 255, 255, 0.11);
-  border-color: var(--teal);
-}
-.launch-card .title { font-weight: 600; font-size: 16px; }
-.launch-card .desc { color: var(--text-dim); font-size: 13px; }
-</style>
-</head>
-<body>
-<div class="card" style="max-width: 720px;">
-  <div class="hero">
-    <h1>TutorMatch</h1>
-    <p class="subtitle">Peer tutoring with AI-powered, timestamped session notes.</p>
-  </div>
 
-  <h2 style="font-size:16px; color: var(--text-dim); font-weight:500; margin-bottom:10px;">
-    Pre-call chat (schedule + questions)
-  </h2>
-  <div class="grid">
-    <a class="launch-card" href="/precall?role=tutee&match=match-123">
-      <span class="title">Join as Tutee</span>
-      <span class="desc">Ask questions, coordinate a meeting time.</span>
-    </a>
-    <a class="launch-card" href="/precall?role=tutor&match=match-123">
-      <span class="title">Join as Tutor</span>
-      <span class="desc">Answer questions, confirm your availability.</span>
-    </a>
-  </div>
-
-  <h2 style="font-size:16px; color: var(--text-dim); font-weight:500; margin:22px 0 10px 0;">
-    Video call (with hidden chat + screen share)
-  </h2>
-  <div class="grid">
-    <a class="launch-card" href="/call?role=tutee&session=session-123">
-      <span class="title">Join as Tutee</span>
-      <span class="desc">Start the video call as the learner.</span>
-    </a>
-    <a class="launch-card" href="/call?role=tutor&session=session-123">
-      <span class="title">Join as Tutor</span>
-      <span class="desc">Start the video call as the teacher.</span>
-    </a>
-  </div>
-</div>
-</body>
-</html>
-"""
-
-
-# ============================================================
-# PRE-CALL PAGE
-# ============================================================
-PRECALL_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>TutorMatch - Pre-call Chat</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-""" + SHARED_CSS + """
-.chat-shell {
-  display: flex;
-  flex-direction: column;
-  height: 60vh;
-  min-height: 380px;
-  background: rgba(0, 0, 0, 0.22);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  overflow: hidden;
-  margin-top: 16px;
-}
-.chat-log {
-  flex: 1;
-  overflow-y: auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.chat-log::-webkit-scrollbar { width: 8px; }
-.chat-log::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
-  border-radius: 8px;
-}
-.msg {
-  max-width: 78%;
-  padding: 10px 14px;
-  border-radius: 14px;
-  font-size: 14px;
-  line-height: 1.45;
-  word-wrap: break-word;
-}
-.msg.mine {
-  align-self: flex-end;
-  background: var(--green);
-  color: white;
-  border-bottom-right-radius: 4px;
-}
-.msg.theirs {
-  align-self: flex-start;
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-bottom-left-radius: 4px;
-}
-.msg.system {
-  align-self: center;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 12px;
-  font-style: italic;
-  padding: 2px 8px;
-}
-.msg .who {
-  display: block;
-  font-size: 11px;
-  font-weight: 700;
-  opacity: 0.75;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: 3px;
-}
-.composer {
-  display: flex;
-  gap: 8px;
-  padding: 12px;
-  background: rgba(0, 0, 0, 0.3);
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-}
-.composer input { flex: 1; }
-</style>
-</head>
-<body>
-<div class="card" style="max-width: 720px;">
-  <div class="meta-row">
-    <span id="roleBadge" class="badge unknown">-</span>
-    <span class="meta-pill">Match: <span id="matchLabel">match-123</span></span>
-    <span class="meta-pill"><span id="statusDot" class="status-dot"></span><span id="statusText">Disconnected</span></span>
-  </div>
-  <h2>Pre-call Chat</h2>
-  <p class="subtitle">Coordinate a time and ask any questions before your session.</p>
-
-  <div class="chat-shell">
-    <div id="messages" class="chat-log"></div>
-    <div class="composer">
-      <input id="input" type="text" placeholder="Type a message and press Enter..." autocomplete="off">
-      <button class="primary" onclick="send()">Send</button>
-    </div>
-  </div>
-</div>
-
-<script>
-const params = new URLSearchParams(window.location.search);
-const myClientId = (params.get('role') || 'tutee').toLowerCase();
-const matchId = params.get('match') || 'match-123';
-
-// Derive ws:// or wss:// based on the current page protocol
-const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-const wsHost = window.location.host;
-
-document.getElementById('roleBadge').textContent = myClientId === 'tutor' ? 'Tutor' : 'Tutee';
-document.getElementById('roleBadge').className = 'badge ' + (myClientId === 'tutor' ? 'tutor' : 'tutee');
-document.getElementById('matchLabel').textContent = matchId;
-
-let ws = null;
-
-function setStatus(live, text) {
-  document.getElementById('statusDot').className = 'status-dot' + (live ? ' live' : '');
-  document.getElementById('statusText').textContent = text;
-}
-
-function appendMessage(kind, text, who) {
-  const box = document.getElementById('messages');
-  const div = document.createElement('div');
-  div.className = 'msg ' + kind;
-  if (who) {
-    const whoEl = document.createElement('span');
-    whoEl.className = 'who';
-    whoEl.textContent = who;
-    div.appendChild(whoEl);
-  }
-  div.appendChild(document.createTextNode(text));
-  box.appendChild(div);
-  box.scrollTop = box.scrollHeight;
-}
-
-function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    ws.close();
-  }
-  ws = new WebSocket(`${wsProtocol}${wsHost}/ws/precall/${matchId}/${myClientId}`);
-
-  ws.addEventListener('open', () => {
-    setStatus(true, 'Connected');
-    appendMessage('system', `You joined as ${myClientId}.`);
-  });
-
-  ws.addEventListener('close', () => setStatus(false, 'Disconnected'));
-
-  ws.addEventListener('message', (e) => {
-    const data = JSON.parse(e.data);
-    if (data.type === 'chat') {
-      if (data.client_id !== myClientId) {
-        appendMessage('theirs', data.content, data.client_id);
-      }
-    } else if (data.type === 'user_joined') {
-      if (data.client_id !== myClientId)
-        appendMessage('system', `${data.client_id} joined the chat.`);
-    } else if (data.type === 'user_left') {
-      appendMessage('system', `${data.client_id} left the chat.`);
-    }
-  });
-}
-
-function send() {
-  const input = document.getElementById('input');
-  const text = input.value.trim();
-  if (!text) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  appendMessage('mine', text, 'You');
-  ws.send(JSON.stringify({ type: 'chat', content: text }));
-  input.value = '';
-  input.focus();
-}
-
-document.getElementById('input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); send(); }
-});
-
-connect();
-</script>
-</body>
-</html>
-"""
-
-
-# ============================================================
-# CALL PAGE
-# ============================================================
-CALL_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>TutorMatch - Video Call</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-""" + SHARED_CSS + """
-.card.wide { max-width: 1100px; }
-.stage {
-  position: relative;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #000;
-  border-radius: 16px;
-  overflow: hidden;
-  box-shadow: var(--shadow);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-#remoteVideo {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
-  background: #000;
-}
-#remoteVideo.contain { object-fit: contain; }
-.local-wrap {
-  position: absolute;
-  bottom: 14px;
-  right: 14px;
-  width: 180px;
-  aspect-ratio: 16 / 9;
-  border-radius: 12px;
-  overflow: hidden;
-  border: 2px solid var(--teal);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
-  background: #000;
-  z-index: 5;
-}
-#localVideo { width: 100%; height: 100%; object-fit: cover; display: block; }
-.chat-panel {
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 280px;
-  height: 100%;
-  background: rgba(0, 40, 50, 0.9);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border-left: 1px solid rgba(255, 255, 255, 0.1);
-  display: flex;
-  flex-direction: column;
-  transform: translateX(100%);
-  transition: transform 0.25s ease;
-  z-index: 10;
-}
-.chat-panel.open { transform: translateX(0); }
-.chat-panel .log {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-  font-size: 13px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.chat-panel .log::-webkit-scrollbar { width: 6px; }
-.chat-panel .log::-webkit-scrollbar-thumb {
-  background: rgba(255,255,255,0.18); border-radius: 6px;
-}
-.chat-panel .composer {
-  display: flex;
-  gap: 6px;
-  padding: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-}
-.chat-panel input { font-size: 13px; padding: 8px 10px; }
-.chat-panel button { padding: 8px 12px; font-size: 13px; }
-
-.cmsg { max-width: 90%; padding: 7px 10px; border-radius: 10px; font-size: 13px; line-height: 1.4; word-wrap: break-word; }
-.cmsg.mine { align-self: flex-end; background: var(--green); color: white; border-bottom-right-radius: 3px; }
-.cmsg.theirs { align-self: flex-start; background: rgba(255, 255, 255, 0.12); border-bottom-left-radius: 3px; }
-.cmsg.system { align-self: center; color: var(--text-dim); font-size: 11px; font-style: italic; }
-
-.controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  justify-content: center;
-  margin-top: 18px;
-}
-.controls button { min-width: 140px; }
-.share-pill {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  background: rgba(37, 163, 111, 0.9);
-  color: white;
-  padding: 6px 12px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  display: none;
-  z-index: 6;
-}
-.share-pill.on { display: inline-block; }
-</style>
-</head>
-<body>
-<div class="card wide">
-  <div class="meta-row">
-    <span id="roleBadge" class="badge unknown">-</span>
-    <span class="meta-pill">Session: <span id="sessionLabel">session-123</span></span>
-    <span class="meta-pill"><span id="statusDot" class="status-dot"></span><span id="statusText">Not connected</span></span>
-  </div>
-  <h2>Video Session</h2>
-  <p class="subtitle">Chat, screen-share, and take notes - all in one place.</p>
-
-  <div class="stage" id="stage">
-    <video id="remoteVideo" autoplay playsinline></video>
-    <div class="local-wrap"><video id="localVideo" autoplay playsinline muted></video></div>
-    <div id="sharePill" class="share-pill">You are sharing your screen</div>
-
-    <div id="chatPanel" class="chat-panel">
-      <div id="chatLog" class="log"></div>
-      <div class="composer">
-        <input id="chatInput" type="text" placeholder="Message..." autocomplete="off">
-        <button class="primary" onclick="sendChat()">Send</button>
-      </div>
-    </div>
-  </div>
-
-  <div class="controls">
-    <button class="primary" id="joinBtn" onclick="start()">Join Call</button>
-    <button class="ghost" id="shareBtn" onclick="toggleShare()" disabled>Share Screen</button>
-    <button class="ghost" id="chatBtn" onclick="toggleChat()" disabled>Toggle Chat</button>
-        <button class="ghost" id="endBtn" onclick="endCall()" disabled>End Call</button>
-        <button class="ghost" id="transcriptBtn" onclick="viewTranscript()" style="display:none;">View Transcript</button>
-  </div>
-</div>
-
-<script>
-const params = new URLSearchParams(window.location.search);
-const myClientId = (params.get('role') || 'tutee').toLowerCase();
-const sessionId = params.get('session') || 'session-123';
-
-// Derive ws:// or wss:// based on the current page protocol
-const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-const wsHost = window.location.host;
-
-document.getElementById('roleBadge').textContent = myClientId === 'tutor' ? 'Tutor' : 'Tutee';
-document.getElementById('roleBadge').className = 'badge ' + (myClientId === 'tutor' ? 'tutor' : 'tutee');
-document.getElementById('sessionLabel').textContent = sessionId;
-
-let ws = null;
-let pc = null;
-let localStream = null;
-let screenStream = null;
-let makingOffer = false;
-let ignoreOffer = false;
-let mediaRecorder = null;
-let recordedChunks = [];
-const isPolite = myClientId === 'tutor';
-const pendingCandidates = [];
-
-// Used if /ice-servers can't be reached. Direct connections still work on most
-// networks; this only loses the TURN relay for restrictive ones.
-const FALLBACK_ICE = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ]
-};
-
-// STUN + TURN from the server, which trades our Cloudflare token for
-// short-lived relay credentials so the token never reaches the browser.
-async function loadIceServers() {
-  try {
-    const resp = await fetch('/ice-servers');
-    if (resp.ok) return await resp.json();
-  } catch (err) {
-    console.warn('Could not load ICE servers, using STUN only:', err);
-  }
-  return FALLBACK_ICE;
-}
-
-function setStatus(live, text) {
-  document.getElementById('statusDot').className = 'status-dot' + (live ? ' live' : '');
-  document.getElementById('statusText').textContent = text;
-}
-
-function appendChat(kind, text, who) {
-  const log = document.getElementById('chatLog');
-  const div = document.createElement('div');
-  div.className = 'cmsg ' + kind;
-  if (who) {
-    const w = document.createElement('b');
-    w.textContent = who + ': ';
-    div.appendChild(w);
-  }
-  div.appendChild(document.createTextNode(text));
-  log.appendChild(div);
-  log.scrollTop = log.scrollHeight;
-}
-
-function showRemoteAsCamera() {
-  document.getElementById('remoteVideo').classList.remove('contain');
-}
-function showRemoteAsScreen() {
-  document.getElementById('remoteVideo').classList.add('contain');
-}
-
-async function start() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-    ws.close();
-  }
-
-  try {
-    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  } catch (err) {
-    alert('Camera/microphone access is required. ' + err.message);
-    return;
-  }
-  document.getElementById('localVideo').srcObject = localStream;
-    if (myClientId === 'tutor') {
-    startRecording();
-  }
-
-  pc = new RTCPeerConnection(await loadIceServers());
-  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
-
-  pc.ontrack = (e) => {
-    const remoteVideo = document.getElementById('remoteVideo');
-    if (!remoteVideo.srcObject) {
-      remoteVideo.srcObject = e.streams[0];
-    }
-    if (e.track.kind === 'video') {
-      const check = () => {
-        if (remoteVideo.videoWidth && remoteVideo.videoHeight) {
-          const ratio = remoteVideo.videoWidth / remoteVideo.videoHeight;
-          if (ratio > 1.5) showRemoteAsScreen();
-          else showRemoteAsCamera();
-        }
-      };
-      e.track.addEventListener('unmute', check);
-      remoteVideo.addEventListener('loadedmetadata', check);
-      setTimeout(check, 500);
-    }
-  };
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
-    }
-  };
-
-  pc.onnegotiationneeded = async () => {
-    try {
-      makingOffer = true;
-      await pc.setLocalDescription();
-      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
-    } catch (err) {
-      console.error(err);
-    } finally {
-      makingOffer = false;
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') setStatus(true, 'Connected');
-    if (pc.connectionState === 'failed') setStatus(false, 'Connection failed');
-  };
-
-  ws = new WebSocket(`${wsProtocol}${wsHost}/ws/call/${sessionId}/${myClientId}`);
-
-  ws.addEventListener('open', () => {
-    setStatus(true, 'Signaling connected');
-    appendChat('system', `You joined as ${myClientId}.`);
-    document.getElementById('joinBtn').disabled = true;
-    document.getElementById('shareBtn').disabled = false;
-    document.getElementById('chatBtn').disabled = false;
-        document.getElementById('endBtn').disabled = false;
-  });
-
-  ws.addEventListener('close', () => setStatus(false, 'Disconnected'));
-
-  ws.addEventListener('message', async (e) => {
-    const data = JSON.parse(e.data);
-    const type = data.type;
-
-    if (type === 'offer' || type === 'answer') {
-      const desc = { type, sdp: data.sdp };
-      const offerCollision = type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
-      ignoreOffer = !isPolite && offerCollision;
-
-      if (ignoreOffer) return;
-
-      if (offerCollision) {
-        await Promise.all([
-          pc.setLocalDescription({ type: 'rollback' }),
-          pc.setRemoteDescription(desc),
-        ]);
-      } else {
-        await pc.setRemoteDescription(desc);
-      }
-
-      while (pendingCandidates.length) {
-        const cand = pendingCandidates.shift();
-        try { await pc.addIceCandidate(cand); } catch (err) { console.error(err); }
-      }
-
-      if (type === 'offer') {
-        await pc.setLocalDescription();
-        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
-      }
-    } else if (type === 'ice-candidate') {
-      const cand = data.candidate;
-      if (!pc.remoteDescription) {
-        pendingCandidates.push(cand);
-      } else {
-        try { await pc.addIceCandidate(cand); } catch (err) { console.error(err); }
-      }
-    } else if (type === 'chat') {
-      if (data.client_id !== myClientId) appendChat('theirs', data.content, data.client_id);
-    } else if (type === 'screen_share_toggle') {
-      if (data.client_id !== myClientId) {
-        if (data.sharing) {
-          showRemoteAsScreen();
-          appendChat('system', `${data.client_id} started screen sharing.`);
-        } else {
-          showRemoteAsCamera();
-          appendChat('system', `${data.client_id} stopped screen sharing.`);
-        }
-      }
-    }
-  });
-}
-
-async function toggleShare() {
-  if (!pc) return;
-  const pill = document.getElementById('sharePill');
-  const shareBtn = document.getElementById('shareBtn');
-
-  if (screenStream) {
-    screenStream.getTracks().forEach(t => t.stop());
-    screenStream = null;
-    const camTrack = localStream.getVideoTracks()[0];
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender) await sender.replaceTrack(camTrack);
-    ws.send(JSON.stringify({ type: 'screen_share_toggle', sharing: false }));
-    pill.classList.remove('on');
-    shareBtn.textContent = 'Share Screen';
-  } else {
-    try {
-      screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 },
-        audio: false,
-      });
-    } catch {
-      return;
-    }
-    const screenTrack = screenStream.getVideoTracks()[0];
-    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
-    if (sender) await sender.replaceTrack(screenTrack);
-    ws.send(JSON.stringify({ type: 'screen_share_toggle', sharing: true }));
-    pill.classList.add('on');
-    shareBtn.textContent = 'Stop Sharing';
-
-    screenTrack.onended = () => {
-      if (screenStream) toggleShare();
-    };
-  }
-}
-function startRecording() {
-  recordedChunks = [];
-  try {
-    mediaRecorder = new MediaRecorder(localStream, { mimeType: 'video/webm;codecs=vp8,opus' });
-  } catch (err) {
-    console.error('MediaRecorder not supported:', err);
-    return;
-  }
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-  };
-  mediaRecorder.start();
-}
-
-async function endCall() {
-  const endBtn = document.getElementById('endBtn');
-  endBtn.disabled = true;
-  endBtn.textContent = 'Saving...';
-
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    const stopped = new Promise((resolve) => { mediaRecorder.onstop = resolve; });
-    mediaRecorder.stop();
-    await stopped;
-
-    const blob = new Blob(recordedChunks, { type: 'video/webm' });
-    const formData = new FormData();
-    formData.append('file', blob, `${sessionId}_${myClientId}.webm`);
-    formData.append('session_id', sessionId);
-    formData.append('role', myClientId);
-
-    try {
-      const resp = await fetch('/upload_recording', { method: 'POST', body: formData });
-      const result = await resp.json();
-      console.log('Recording uploaded:', result);
-      appendChat('system', 'Recording saved and sent for processing.');
-    } catch (err) {
-      console.error('Upload failed:', err);
-      appendChat('system', 'Recording upload failed.');
-    }
-  }
-
-  if (ws) ws.close();
-  if (pc) pc.close();
-  if (localStream) localStream.getTracks().forEach(t => t.stop());
-  document.getElementById('transcriptBtn').style.display = 'inline-block';
-  endBtn.textContent = 'Call Ended';
-}
-
-function viewTranscript() {
-  window.open(`/transcript/${sessionId}`, '_blank');
-}
-
-function toggleChat() {
-  const panel = document.getElementById('chatPanel');
-  panel.classList.toggle('open');
-}
-
-function sendChat() {
-  const input = document.getElementById('chatInput');
-  const text = input.value.trim();
-  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-  appendChat('mine', text, 'You');
-  ws.send(JSON.stringify({ type: 'chat', content: text }));
-  input.value = '';
-  input.focus();
-}
-
-document.getElementById('chatInput').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') { e.preventDefault(); sendChat(); }
-});
-</script>
-</body>
-</html>
-"""
-
+@app.get("/notes/{session_id}/{fmt}")
+async def download_notes(session_id: str, fmt: str, request: Request):
+    """Download the latest call's notes file: /notes/<room>/md or /notes/<room>/json."""
+    if fmt not in ("md", "json"):
+        raise HTTPException(status_code=404)
+    _, session = _participant(request, session_id)
+    folder = _latest_notes_folder(session)
+    if folder is None:
+        raise HTTPException(status_code=404, detail="No notes have been written for this session yet")
+    return FileResponse(
+        folder / f"notes.{fmt}",
+        media_type="text/markdown; charset=utf-8" if fmt == "md" else "application/json",
+        filename=f"tutoring-notes-{folder.name}.{fmt}",
+    )
 
 TRANSCRIPT_HTML = """
 <!DOCTYPE html>
@@ -1158,14 +511,24 @@ TRANSCRIPT_HTML = """
 .segment { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
 .segment .t { color: #9fd; opacity: 0.8; margin-right: 8px; font-variant-numeric: tabular-nums; }
 #status { opacity: 0.8; margin-bottom: 16px; }
+a.btn {
+  display: inline-block; margin: 0 8px 8px 0; padding: 10px 18px; border-radius: 10px;
+  background: var(--green); color: white; font-size: 14px; font-weight: 600; text-decoration: none;
+}
+a.btn + a.btn { background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.15); }
+a.btn:hover { filter: brightness(1.12); }
 </style>
 </head>
 <body>
 <div class="card wide">
   <h2>Session Transcript</h2>
   <div id="status">Loading...</div>
+  <div id="downloads" style="display:none; margin-bottom: 16px;">
+    <a class="btn" id="downloadMd">Download notes</a>
+    <a class="btn" id="downloadJson">Download notes (JSON)</a>
+  </div>
   <div id="notesSection" style="display:none;">
-    <h3>Highlights</h3>
+    <h3>Key parts</h3>
     <div id="moments"></div>
   </div>
   <div id="transcriptSection" style="display:none;">
@@ -1182,6 +545,13 @@ function fmt(ms) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+// Transcript text is whatever was said on the call - never insert it as HTML.
+function esc(value) {
+  const div = document.createElement('div');
+  div.textContent = value == null ? '' : String(value);
+  return div.innerHTML;
+}
+
 async function load() {
   const sessionId = window.location.pathname.split('/').pop();
   const statusEl = document.getElementById('status');
@@ -1189,19 +559,29 @@ async function load() {
     const resp = await fetch(`/api/transcript/${sessionId}`);
     const data = await resp.json();
 
+    if (data.status === 'failed') {
+      statusEl.textContent = "Sorry - this call's notes couldn't be written. The recording is saved, so they can be re-run.";
+      return;
+    }
     if (!data.ready) {
-      statusEl.textContent = 'Transcript is still processing - check back in a moment.';
+      statusEl.textContent = 'Writing your notes - this usually takes about a minute...';
       setTimeout(load, 4000);
       return;
     }
 
     statusEl.style.display = 'none';
 
+    if (data.has_notes_file) {
+      document.getElementById('downloadMd').href = `/notes/${sessionId}/md`;
+      document.getElementById('downloadJson').href = `/notes/${sessionId}/json`;
+      document.getElementById('downloads').style.display = 'block';
+    }
+
     const moments = (data.notes && data.notes.key_moments) || [];
     if (moments.length) {
       document.getElementById('notesSection').style.display = 'block';
       document.getElementById('moments').innerHTML = moments.map(m => `
-        <div class="moment"><span class="t">${fmt(m.tMs)}</span><strong>${m.title || ''}</strong><div>${m.why || ''}</div></div>
+        <div class="moment"><span class="t">${fmt(m.tMs)}</span><strong>${esc(m.title)}</strong><div>${esc(m.why)}</div></div>
       `).join('');
     }
 
@@ -1209,7 +589,7 @@ async function load() {
     if (segments.length) {
       document.getElementById('transcriptSection').style.display = 'block';
       document.getElementById('segments').innerHTML = segments.map(s => `
-        <div class="segment"><span class="t">${fmt(s.start_ms)}</span>${s.text || ''}</div>
+        <div class="segment"><span class="t">${fmt(s.start_ms)}</span>${esc(s.text)}</div>
       `).join('');
     }
 

@@ -42,6 +42,7 @@ Everything for the data layer lives in this one file. Owned by Caden.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import sys
 from contextlib import contextmanager
@@ -132,6 +133,8 @@ class TutorMatch(_Dictable):
     style_similarity: float = 0.0
     subject_overlap: float = 0.0
     teaching_levels: list[str] = field(default_factory=list)
+    # For linking to the tutor's profile page.
+    public_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -172,7 +175,13 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";   -- gen_random_uuid()
 
 CREATE TABLE IF NOT EXISTS users (
   auth_sub        text PRIMARY KEY,
+  -- Opaque ID for profile URLs, so Auth0 IDs never appear in addresses.
+  -- md5 is just a stable slug here, not security.
+  public_id       text GENERATED ALWAYS AS (substr(md5(auth_sub), 1, 16)) STORED,
   role            text NOT NULL DEFAULT 'student',
+  -- Chosen at onboarding. Auth0's `name` is the email address for
+  -- email/password sign-ups, so it must never be shown on a public profile.
+  display_name    text,
   name            text,
   email           text,
   avatar_url      text,
@@ -290,6 +299,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS sessions_room_key ON sessions (room_key);
 -- Migration for databases created before grade/teaching levels existed.
 ALTER TABLE learner_profiles ADD COLUMN IF NOT EXISTS grade_level text;
 ALTER TABLE tutor_profiles   ADD COLUMN IF NOT EXISTS teaching_levels text[];
+
+-- Migration for databases created before profiles had names and public IDs.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS public_id text
+  GENERATED ALWAYS AS (substr(md5(auth_sub), 1, 16)) STORED;
+CREATE UNIQUE INDEX IF NOT EXISTS users_public_id ON users (public_id);
 """
 
 _pool: ConnectionPool | None = None
@@ -506,6 +521,38 @@ def is_onboarded(auth_sub: str) -> bool:
         return False
     key = "tutor" if profile["user"]["role"] == "tutor" else "learner"
     return profile[key] is not None
+
+
+def set_display_name(auth_sub: str, display_name: str) -> None:
+    execute("UPDATE users SET display_name = %s WHERE auth_sub = %s", (display_name, auth_sub))
+
+
+def get_user_by_public_id(public_id: str) -> dict[str, Any] | None:
+    return fetch_one("SELECT * FROM users WHERE public_id = %s", (public_id,))
+
+
+def public_name(user: dict[str, Any]) -> str:
+    """The name to show other people. Never an email address.
+
+    Auth0 fills `name` with the email for email/password sign-ups, so it is
+    only used when it doesn't look like one - which covers seeded tutors and
+    social logins that provide a real name.
+    """
+    if user.get("display_name"):
+        return user["display_name"]
+    name = user.get("name") or ""
+    return name if name and "@" not in name else "TutorMatch member"
+
+
+def pair_room_key(sub_a: str, sub_b: str) -> str:
+    """The chat/call room for two people - the same whichever of them asks.
+
+    Sorting makes it order-independent, so a student opening a chat with a
+    tutor and that tutor opening a chat with the student land in one room.
+    Hashed so the room name doesn't reveal either Auth0 ID.
+    """
+    pair = "\n".join(sorted((sub_a, sub_b)))
+    return "pair-" + hashlib.sha256(pair.encode("utf-8")).hexdigest()[:24]
 
 
 # ----------------------------------------------------------------- sessions
@@ -1369,6 +1416,31 @@ def explain(answers: dict[str, str], affinity: dict[str, Any], limit: int = 2) -
     return f"This tutor {picked[0]} and {picked[1]} - both things you asked for."
 
 
+def describe_teaching_style(affinity: dict[str, Any]) -> list[str]:
+    """How a tutor teaches, one trait per axis, for their profile page.
+
+    Uses each axis's highest-scored answer, which is the tutor's own pick for
+    real accounts and the strongest trait for hand-tuned seeded tutors.
+    """
+    traits = []
+    for ax in STYLE_AXES:
+        scores = affinity.get(ax) or {}
+        if scores:
+            top = max(scores, key=lambda k: float(scores[k]))
+            if phrase := _TUTOR_PHRASES.get(ax, {}).get(top):
+                traits.append(phrase)
+    return traits
+
+
+def describe_learning_style(answers: dict[str, Any]) -> list[str]:
+    """How a student learns, one trait per answered axis, for their profile page."""
+    return [
+        _LEARNER_PHRASES[ax][answers[ax]]
+        for ax in STYLE_AXES
+        if answers.get(ax) in _LEARNER_PHRASES.get(ax, {})
+    ]
+
+
 # Scoring happens in SQL so TigerData does the work. Each axis contributes the
 # tutor's stored affinity for the answer this student gave; missing entries
 # score 0 via COALESCE.
@@ -1379,7 +1451,7 @@ _STYLE_SUM = " + ".join(
 MATCH_SQL = f"""
 WITH scored AS (
     SELECT
-        u.auth_sub, u.name, u.email, u.avatar_url,
+        u.auth_sub, u.name, u.display_name, u.public_id, u.email, u.avatar_url,
         tp.bio, tp.subjects, tp.hourly_rate_sol, tp.rating, tp.style_affinity,
         tp.teaching_levels,
         ({_STYLE_SUM}) / {len(STYLE_AXES)}.0 AS style_score,
@@ -1436,10 +1508,11 @@ def find_matches(
             user=User(
                 auth_sub=r["auth_sub"],
                 role="tutor",
-                name=r["name"],
+                name=public_name(r),
                 email=r["email"],
                 avatar_url=r["avatar_url"],
             ),
+            public_id=r["public_id"],
             bio=r["bio"],
             subjects=r["subjects"],
             hourly_rate_sol=float(r["hourly_rate_sol"]),

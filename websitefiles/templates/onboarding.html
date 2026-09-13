@@ -34,6 +34,14 @@
 
     <form method="POST" action="{{ url_for('views.onboarding') }}">
 
+      <div class="form-group mb-4">
+        <label for="display_name" class="h5 d-block">Display name</label>
+        <input class="form-control" id="display_name" name="display_name" type="text" required
+               minlength="2" maxlength="{{ name_max }}" autocomplete="nickname"
+               value="{{ values.get('display_name') or '' }}" style="max-width: 24rem;">
+        <small class="form-text text-muted">Shown on your public profile. Don't use your email address.</small>
+      </div>
+
       <h2 class="h5">1. I am a...</h2>
       {# No data-toggle="buttons" on purpose. Bootstrap 4.0's button plugin cancels the
          click and announces the change through jQuery only, which native listeners

@@ -166,7 +166,9 @@ def callback():
 
     session["user"] = {
         "sub": info["sub"],
-        "name": info.get("name") or info.get("email"),
+        # Only shown to the user themselves in the navbar, so the email is an
+        # acceptable fallback until they choose a display name.
+        "name": row.get("display_name") or info.get("name") or info.get("email"),
         "email": info.get("email"),
         "picture": info.get("picture"),
         # Role lives in TigerData, not Auth0, so read it back from the row.

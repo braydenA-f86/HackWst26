@@ -1,0 +1,411 @@
+{% extends "base.html" %}
+{% block title %}Video call with {{ other_name }}{% endblock %}
+
+{% block content %}
+<style>
+  .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #adb5bd; margin-right: 6px; vertical-align: middle; }
+  .status-dot.live { background: #307e4e; box-shadow: 0 0 6px #307e4e; }
+  .stage { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: .5rem; overflow: hidden; }
+  #remoteVideo { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; }
+  #remoteVideo.contain { object-fit: contain; }
+  .local-wrap { position: absolute; bottom: 14px; right: 14px; width: 22%; min-width: 120px; aspect-ratio: 16 / 9; border-radius: .4rem; overflow: hidden; border: 2px solid #307e4e; box-shadow: 0 6px 20px rgba(0,0,0,.5); background: #000; z-index: 5; }
+  #localVideo { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .chat-panel { position: absolute; top: 0; right: 0; width: 300px; max-width: 85%; height: 100%; background: rgba(255,255,255,.97); border-left: 1px solid #dee2e6; display: flex; flex-direction: column; transform: translateX(100%); transition: transform .25s ease; z-index: 10; }
+  .chat-panel.open { transform: translateX(0); }
+  .chat-panel .log { flex: 1; overflow-y: auto; padding: 12px; font-size: .875rem; display: flex; flex-direction: column; gap: 8px; }
+  .cmsg { max-width: 90%; padding: 6px 10px; border-radius: 10px; line-height: 1.4; word-wrap: break-word; }
+  .cmsg.mine { align-self: flex-end; background: #307e4e; color: #fff; border-bottom-right-radius: 3px; }
+  .cmsg.theirs { align-self: flex-start; background: #e9ecef; border-bottom-left-radius: 3px; }
+  .cmsg.system { align-self: center; color: #6c757d; font-size: .75rem; font-style: italic; }
+  .share-pill { position: absolute; top: 14px; left: 14px; background: rgba(48,126,78,.92); color: #fff; padding: 4px 12px; border-radius: 999px; font-size: .8rem; font-weight: 600; display: none; z-index: 6; }
+  .share-pill.on { display: inline-block; }
+</style>
+
+<div class="card my-4 shadow-sm">
+  <div class="card-header bg-white d-flex flex-wrap justify-content-between align-items-center">
+    <div class="mr-3">
+      <h1 class="h5 mb-0">
+        Video call with <a href="{{ url_for('views.profile', public_id=other_public_id) }}">{{ other_name }}</a>
+      </h1>
+      <small class="text-muted">
+        You're the {{ 'tutor' if call_role == 'tutor' else 'student' }}
+        {% if call_role == 'tutor' %}&middot; this call is recorded for notes{% endif %}
+        &middot; <span id="statusDot" class="status-dot"></span><span id="statusText">Not connected</span>
+      </small>
+    </div>
+    <a class="btn btn-outline-secondary btn-sm mt-2 mt-sm-0" href="{{ url_for('views.chat', public_id=other_public_id) }}">Back to chat</a>
+  </div>
+
+  <div class="card-body">
+    <div class="stage" id="stage">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <div class="local-wrap"><video id="localVideo" autoplay playsinline muted></video></div>
+      <div id="sharePill" class="share-pill">You are sharing your screen</div>
+
+      <div id="chatPanel" class="chat-panel">
+        <div id="chatLog" class="log"></div>
+        <div class="p-2 border-top">
+          <div class="input-group input-group-sm">
+            <input id="chatInput" type="text" class="form-control" placeholder="Message..." autocomplete="off" maxlength="2000">
+            <div class="input-group-append">
+              <button class="btn btn-success" type="button" onclick="sendChat()">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="d-flex flex-wrap justify-content-center mt-3">
+      <button class="btn btn-success m-1" id="joinBtn" onclick="start()">Join call</button>
+      <button class="btn btn-outline-secondary m-1" id="shareBtn" onclick="toggleShare()" disabled>Share screen</button>
+      <button class="btn btn-outline-secondary m-1" id="chatBtn" onclick="toggleChat()" disabled>Toggle chat</button>
+      <button class="btn btn-outline-danger m-1" id="endBtn" onclick="endCall()" disabled>End call</button>
+      <button class="btn btn-outline-success m-1" id="transcriptBtn" onclick="viewTranscript()" style="display:none;">View transcript</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Room and role come from the server: the room is worked out from the two
+// people's IDs, and the call needs exactly one tutor and one tutee.
+const myClientId = {{ call_role | tojson }};
+const sessionId = {{ room | tojson }};
+const otherName = {{ other_name | tojson }};
+
+// Live signaling, recording uploads and transcripts run on the video app.
+// An empty URL means it's served from this same address (a combined deployment).
+const VIDEO_APP = {{ video_app_url | tojson }} || window.location.origin;
+const VIDEO_WS = VIDEO_APP.replace(/^http/, 'ws');   // http->ws, https->wss
+
+let ws = null;
+let pc = null;
+let localStream = null;
+let screenStream = null;
+let makingOffer = false;
+let ignoreOffer = false;
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingMix = null;
+const isPolite = myClientId === 'tutor';
+const pendingCandidates = [];
+
+// Used if /ice-servers can't be reached. Direct connections still work on most
+// networks; this only loses the TURN relay for restrictive ones.
+const FALLBACK_ICE = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ]
+};
+
+// STUN + TURN from this site, which trades our Cloudflare token for
+// short-lived relay credentials so the token never reaches the browser.
+async function loadIceServers() {
+  try {
+    const resp = await fetch('/ice-servers');
+    if (resp.ok) return await resp.json();
+  } catch (err) {
+    console.warn('Could not load ICE servers, using STUN only:', err);
+  }
+  return FALLBACK_ICE;
+}
+
+function setStatus(live, text) {
+  document.getElementById('statusDot').className = 'status-dot' + (live ? ' live' : '');
+  document.getElementById('statusText').textContent = text;
+}
+
+function appendChat(kind, text, who) {
+  const log = document.getElementById('chatLog');
+  const div = document.createElement('div');
+  div.className = 'cmsg ' + kind;
+  if (who) {
+    const w = document.createElement('b');
+    w.textContent = who + ': ';
+    div.appendChild(w);
+  }
+  div.appendChild(document.createTextNode(text));
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function showRemoteAsCamera() {
+  document.getElementById('remoteVideo').classList.remove('contain');
+}
+function showRemoteAsScreen() {
+  document.getElementById('remoteVideo').classList.add('contain');
+}
+
+async function start() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    ws.close();
+  }
+
+  // Created right on the Join click: browsers only let audio start from a click.
+  if (myClientId === 'tutor' && !recordingMix) createRecordingMix();
+
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch (err) {
+    alert('Camera/microphone access is required. ' + err.message);
+    return;
+  }
+  document.getElementById('localVideo').srcObject = localStream;
+  if (myClientId === 'tutor') {
+    startRecording();
+  }
+
+  pc = new RTCPeerConnection(await loadIceServers());
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  pc.ontrack = (e) => {
+    if (e.track.kind === 'audio') addToRecordingMix(new MediaStream([e.track]));
+    const remoteVideo = document.getElementById('remoteVideo');
+    if (!remoteVideo.srcObject) {
+      remoteVideo.srcObject = e.streams[0];
+    }
+    if (e.track.kind === 'video') {
+      const check = () => {
+        if (remoteVideo.videoWidth && remoteVideo.videoHeight) {
+          const ratio = remoteVideo.videoWidth / remoteVideo.videoHeight;
+          if (ratio > 1.5) showRemoteAsScreen();
+          else showRemoteAsCamera();
+        }
+      };
+      e.track.addEventListener('unmute', check);
+      remoteVideo.addEventListener('loadedmetadata', check);
+      setTimeout(check, 500);
+    }
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ice-candidate', candidate: e.candidate }));
+    }
+  };
+
+  pc.onnegotiationneeded = async () => {
+    try {
+      makingOffer = true;
+      await pc.setLocalDescription();
+      ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+    } catch (err) {
+      console.error(err);
+    } finally {
+      makingOffer = false;
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus(true, 'Connected');
+    if (pc.connectionState === 'failed') setStatus(false, 'Connection failed');
+  };
+
+  ws = new WebSocket(`${VIDEO_WS}/ws/call/${sessionId}/${myClientId}`);
+
+  ws.addEventListener('open', () => {
+    setStatus(true, 'Signaling connected');
+    appendChat('system', `You joined the call with ${otherName}.`);
+    document.getElementById('joinBtn').disabled = true;
+    document.getElementById('shareBtn').disabled = false;
+    document.getElementById('chatBtn').disabled = false;
+    document.getElementById('endBtn').disabled = false;
+  });
+
+  ws.addEventListener('close', () => setStatus(false, 'Disconnected'));
+  ws.addEventListener('error', () => setStatus(false, 'Could not reach the call server'));
+
+  ws.addEventListener('message', async (e) => {
+    const data = JSON.parse(e.data);
+    const type = data.type;
+
+    if (type === 'offer' || type === 'answer') {
+      const desc = { type, sdp: data.sdp };
+      const offerCollision = type === 'offer' && (makingOffer || pc.signalingState !== 'stable');
+      ignoreOffer = !isPolite && offerCollision;
+
+      if (ignoreOffer) return;
+
+      if (offerCollision) {
+        await Promise.all([
+          pc.setLocalDescription({ type: 'rollback' }),
+          pc.setRemoteDescription(desc),
+        ]);
+      } else {
+        await pc.setRemoteDescription(desc);
+      }
+
+      while (pendingCandidates.length) {
+        const cand = pendingCandidates.shift();
+        try { await pc.addIceCandidate(cand); } catch (err) { console.error(err); }
+      }
+
+      if (type === 'offer') {
+        await pc.setLocalDescription();
+        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
+      }
+    } else if (type === 'ice-candidate') {
+      const cand = data.candidate;
+      if (!pc.remoteDescription) {
+        pendingCandidates.push(cand);
+      } else {
+        try { await pc.addIceCandidate(cand); } catch (err) { console.error(err); }
+      }
+    } else if (type === 'chat') {
+      if (data.client_id !== myClientId) appendChat('theirs', data.content, otherName);
+    } else if (type === 'screen_share_toggle') {
+      if (data.client_id !== myClientId) {
+        if (data.sharing) {
+          showRemoteAsScreen();
+          appendChat('system', `${otherName} started screen sharing.`);
+        } else {
+          showRemoteAsCamera();
+          appendChat('system', `${otherName} stopped screen sharing.`);
+        }
+      }
+    }
+  });
+}
+
+async function toggleShare() {
+  if (!pc) return;
+  const pill = document.getElementById('sharePill');
+  const shareBtn = document.getElementById('shareBtn');
+
+  if (screenStream) {
+    screenStream.getTracks().forEach(t => t.stop());
+    screenStream = null;
+    const camTrack = localStream.getVideoTracks()[0];
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(camTrack);
+    ws.send(JSON.stringify({ type: 'screen_share_toggle', sharing: false }));
+    pill.classList.remove('on');
+    shareBtn.textContent = 'Share screen';
+  } else {
+    try {
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: false,
+      });
+    } catch {
+      return;
+    }
+    const screenTrack = screenStream.getVideoTracks()[0];
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(screenTrack);
+    ws.send(JSON.stringify({ type: 'screen_share_toggle', sharing: true }));
+    pill.classList.add('on');
+    shareBtn.textContent = 'Stop sharing';
+
+    screenTrack.onended = () => {
+      if (screenStream) toggleShare();
+    };
+  }
+}
+
+// The notes need both voices, but the camera stream only has the tutor's mic.
+// Mix the tutor's mic and the other person's audio into one track to record.
+function createRecordingMix() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    const ctx = new Ctx();
+    recordingMix = { ctx, dest: ctx.createMediaStreamDestination(), sources: [] };
+  } catch (err) {
+    console.warn('Audio mixing unavailable, recording only this microphone:', err);
+  }
+}
+
+function addToRecordingMix(stream) {
+  if (!recordingMix || !stream.getAudioTracks().length) return;
+  const source = recordingMix.ctx.createMediaStreamSource(stream);
+  source.connect(recordingMix.dest);
+  recordingMix.sources.push(source);   // keep a reference so it isn't garbage collected
+}
+
+function startRecording() {
+  recordedChunks = [];
+  let recordStream = localStream;
+  if (recordingMix) {
+    recordingMix.ctx.resume();
+    addToRecordingMix(localStream);
+    recordStream = new MediaStream([
+      ...localStream.getVideoTracks(),
+      ...recordingMix.dest.stream.getAudioTracks(),
+    ]);
+  }
+  try {
+    mediaRecorder = new MediaRecorder(recordStream, { mimeType: 'video/webm;codecs=vp8,opus' });
+  } catch (err) {
+    console.error('MediaRecorder not supported:', err);
+    return;
+  }
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+  };
+  mediaRecorder.start();
+}
+
+async function endCall() {
+  const endBtn = document.getElementById('endBtn');
+  endBtn.disabled = true;
+  endBtn.textContent = 'Saving...';
+
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    const stopped = new Promise((resolve) => { mediaRecorder.onstop = resolve; });
+    mediaRecorder.stop();
+    await stopped;
+
+    const blob = new Blob(recordedChunks, { type: 'video/webm' });
+    const formData = new FormData();
+    formData.append('file', blob, `${sessionId}_${myClientId}.webm`);
+    formData.append('session_id', sessionId);
+    formData.append('role', myClientId);
+
+    try {
+      // credentials: send the login cookie so the video app knows who's uploading.
+      const resp = await fetch(`${VIDEO_APP}/upload_recording`, {
+        method: 'POST', body: formData, credentials: 'include',
+      });
+      const result = await resp.json();
+      if (!resp.ok) throw new Error(result.detail || `HTTP ${resp.status}`);
+      console.log('Recording uploaded:', result);
+      appendChat('system', 'Recording saved. Your notes are being written - open "View transcript" in about a minute.');
+    } catch (err) {
+      console.error('Upload failed:', err);
+      appendChat('system', 'Recording upload failed: ' + err.message);
+    }
+  }
+
+  if (ws) ws.close();
+  if (pc) pc.close();
+  if (localStream) localStream.getTracks().forEach(t => t.stop());
+  if (recordingMix) recordingMix.ctx.close();
+  document.getElementById('transcriptBtn').style.display = 'inline-block';
+  endBtn.textContent = 'Call ended';
+}
+
+function viewTranscript() {
+  window.open(`${VIDEO_APP}/transcript/${sessionId}`, '_blank');
+}
+
+function toggleChat() {
+  const panel = document.getElementById('chatPanel');
+  panel.classList.toggle('open');
+}
+
+function sendChat() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  appendChat('mine', text, 'You');
+  ws.send(JSON.stringify({ type: 'chat', content: text }));
+  input.value = '';
+  input.focus();
+}
+
+document.getElementById('chatInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendChat(); }
+});
+</script>
+{% endblock %}
